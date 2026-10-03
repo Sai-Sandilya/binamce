@@ -29,6 +29,14 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(restored["position"]["symbol"], "BTCUSDT")
             self.assertEqual(restored["daily"]["pnl_pct"], -1.25)
 
+    def test_corrupt_state_does_not_reset_safety_limits_silently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{not valid json")
+            state = load_state(path)
+            self.assertIsNotNone(state["load_error"])
+
     def test_order_book_failure_blocks_entry(self):
         bullish, ratio, spread = check_order_book(BrokenOrderBookClient(), "BTCUSDT")
         self.assertFalse(bullish)
