@@ -50,6 +50,13 @@ API_SECRET = _require_env("BINANCE_API_SECRET")
 TESTNET = False   # ← ALWAYS start with True. Set False only for live trading.
 BOT_MODE = "SCREENER"  # Options: "SCREENER" (RSI/EMA bot) or "GRID" (Grid trading bot)
 
+# Bound every Binance HTTP request. Without this, a stalled socket can freeze
+# startup before the bot has reconciled positions or started scanning.
+BINANCE_REQUEST_TIMEOUT_SEC = 10
+# A second, process-level deadline for startup recovery requests.  On macOS
+# this interrupts a socket read even if the HTTP client's timeout is ignored.
+BINANCE_STARTUP_DEADLINE_SEC = 15
+
 # ── TRADING PAIR ─────────────────────────────────────────────
 # Options: "BNBUSDT", "BTCUSDT", etc. (Only used if MULTI_COIN = False)
 SYMBOL = "BTCUSDT"

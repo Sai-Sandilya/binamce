@@ -7,6 +7,7 @@ import sys
 import time
 import importlib
 import requests
+import threading
 from datetime import datetime
 
 from binance.client import Client
@@ -29,6 +30,42 @@ WHITE  = "\033[97m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
 RESET  = "\033[0m"
+
+
+class BinanceCallDeadlineExceeded(TimeoutError):
+    """Raised when a synchronous Binance request exceeds the safety deadline."""
+
+
+def call_binance_with_deadline(operation, seconds: float):
+    """
+    Return a Binance call's result, or fail closed after a hard deadline.
+
+    The local Binance client can occasionally remain blocked below requests,
+    where HTTP timeouts and signals are ineffective. The worker is a daemon,
+    so a permanently stalled read cannot stop this process from entering its
+    no-trade safety halt or exiting. It is used only for read-only startup
+    reconciliation calls; no order submission is ever run in this worker.
+    """
+    completed = threading.Event()
+    outcome = {}
+
+    def _run():
+        try:
+            outcome["value"] = operation()
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=_run, daemon=True, name="binance-startup-read")
+    worker.start()
+    if not completed.wait(seconds):
+        raise BinanceCallDeadlineExceeded(
+            f"Binance API call exceeded {seconds:g}-second deadline"
+        )
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 
 def log(msg: str, color: str = WHITE):
@@ -177,7 +214,17 @@ def run_bot():
     print(f"{RESET}", flush=True)
     divider("=", CYAN)
 
-    client = Client(config.API_KEY, config.API_SECRET, testnet=config.TESTNET)
+    # python-binance otherwise leaves socket reads unbounded.  A timed-out
+    # recovery request is safer than a process frozen before it can report an
+    # unreconciled holding and halt new entries.
+    client = Client(
+        config.API_KEY,
+        config.API_SECRET,
+        testnet=config.TESTNET,
+        requests_params={
+            "timeout": float(getattr(config, "BINANCE_REQUEST_TIMEOUT_SEC", 10))
+        },
+    )
 
     # Sync clock to avoid Timestamp -1021 error
     try:
@@ -304,11 +351,15 @@ def run_bot():
 
     # ── TRAILING PROFIT LOCK ──────────────────────────────────
     trail_sl_price    = None  # dynamically raised SL once profit > 0.5%
+    startup_api_halt = False
 
     # ── AUTO-RESTORE ACTIVE OCO POSITION ─────────────────────
     log("Checking for active open trades on Binance...", DIM)
     try:
-        open_orders = client.get_open_orders()
+        open_orders = call_binance_with_deadline(
+            client.get_open_orders,
+            float(getattr(config, "BINANCE_STARTUP_DEADLINE_SEC", 15)),
+        )
         oco_orders = [o for o in open_orders if o.get('orderListId', -1) != -1]
         if oco_orders:
             first_oco = oco_orders[0]
@@ -375,28 +426,26 @@ def run_bot():
             divider("-")
             persist_runtime_state()
     except Exception as e:
+        startup_api_halt = True
         log(f"⚠️ Position auto-recovery check failed: {e}", DIM)
 
     # Resolve an order submitted before a crash/timeout before treating the
     # account as flat. Partial fills are positions and need protection too.
     pending_buy = persistent_state.get("pending_buy")
-    if not in_position and pending_buy:
+    if not startup_api_halt and not in_position and pending_buy:
         try:
-            if not pending_buy.get("submitted") or not pending_buy.get("order_id"):
-                raise RuntimeError("buy submission was interrupted before an order ID was recorded")
-            pending_order = client.get_order(
-                symbol=pending_buy["symbol"], orderId=pending_buy["order_id"]
+            recovery_trader = Trader(client, pending_buy["symbol"])
+            order_id = pending_buy.get("order_id")
+            # Includes bounded retries, lookup by durable client order id
+            # after a lost submit response, and cancel-plus-terminal-status
+            # confirmation for orders that are still open.
+            pending_order = recovery_trader.reconcile_pending_buy(
+                order_id=order_id,
+                client_order_id=pending_buy.get("client_order_id"),
             )
-            # A partial buy can remain open after the process stops. Cancel
-            # and re-read it before protecting the executed quantity; without
-            # this, additional fills could arrive outside the OCO quantity.
-            if pending_order.get("status") not in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
-                client.cancel_order(
-                    symbol=pending_buy["symbol"], orderId=pending_buy["order_id"]
-                )
-                pending_order = client.get_order(
-                    symbol=pending_buy["symbol"], orderId=pending_buy["order_id"]
-                )
+            order_id = pending_order["orderId"]
+            pending_buy["order_id"] = order_id
+            pending_buy["submitted"] = True
             executed_qty = float(pending_order.get("executedQty", 0) or 0)
             if executed_qty > 0:
                 quoted = float(pending_order.get("cummulativeQuoteQty", 0) or 0)
@@ -418,9 +467,13 @@ def run_bot():
                     "signal_vol": None,
                     "signal_ob": None,
                 }
-                persistent_state["pending_buy"] = None
-                daily_trades += 1
+                # Mark this particular order before clearing it. A process
+                # crash after the fill is recorded must not count it again.
+                if not pending_buy.get("trade_counted"):
+                    daily_trades += 1
+                    pending_buy["trade_counted"] = True
                 persistent_state["daily"]["trades"] = daily_trades
+                persistent_state["pending_buy"] = None
                 save_state(persistent_state)
                 log(
                     f"⚠️ Reconciled a prior {pending_order.get('status')} buy with "
@@ -442,7 +495,7 @@ def run_bot():
     # resume scanning around it. Recreate exchange-side protection; if that
     # cannot be done, sell rather than leaving an unprotected position.
     saved_position = persistent_state.get("position")
-    if not in_position and saved_position:
+    if not startup_api_halt and not in_position and saved_position:
         try:
             active_symbol = saved_position["symbol"]
             base_asset = saved_position["base_asset"]
@@ -511,8 +564,8 @@ def run_bot():
     # Do not open a fresh trade if Binance reports a meaningful asset that is
     # not represented by a bot position. It may be a previously interrupted
     # buy or a manual holding; either way, guessing its cost basis is unsafe.
-    reconciliation_halt = state_load_halt
-    if not in_position:
+    reconciliation_halt = state_load_halt or startup_api_halt
+    if not startup_api_halt and not in_position:
         try:
             account = client.get_account()
             unknown_assets = []
@@ -766,10 +819,17 @@ def run_bot():
                             "trade_amount": trade_amount,
                             "take_profit_pct": dyn_tp,
                             "stop_loss_pct": dyn_sl,
+                            # This identifier is durable before Binance sees
+                            # the request, allowing recovery after a response
+                            # timeout without submitting a second buy.
+                            "client_order_id": trader.new_client_order_id(),
                             "submitted": False,
                         }
                         save_state(persistent_state)
-                        order, limit_price, quantity = trader.buy_limit(trade_amount)
+                        order, limit_price, quantity = trader.buy_limit(
+                            trade_amount,
+                            client_order_id=persistent_state["pending_buy"]["client_order_id"],
+                        )
                         persistent_state["pending_buy"].update({
                             "submitted": True,
                             "order_id": order["orderId"],

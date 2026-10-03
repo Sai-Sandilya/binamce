@@ -3,6 +3,7 @@
 # =============================================================
 
 import math
+import uuid
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
@@ -115,7 +116,7 @@ class Trader:
         precision = max(0, int(round(-math.log(self.tick_size, 10), 0)))
         return f"{rounded:.{precision}f}"
 
-    def buy_limit(self, usdt_amount: float):
+    def buy_limit(self, usdt_amount: float, client_order_id: str | None = None):
         """
         Rest a limit buy on the best bid so the order is a maker, not a taker.
         Returns the open order, the limit price, and the quantity.
@@ -141,15 +142,31 @@ class Trader:
                 f"Order notional {notional:.2f} USDT is below minimum {self.min_notional} USDT."
             )
 
+        order_params = {
+            "symbol": self.symbol,
+            "side": Client.SIDE_BUY,
+            "type": Client.ORDER_TYPE_LIMIT,
+            "timeInForce": Client.TIME_IN_FORCE_GTC,
+            "quantity": qty,
+            "price": price_str,
+        }
+        if client_order_id:
+            order_params["newClientOrderId"] = client_order_id
         order = self.client.create_order(
-            symbol      = self.symbol,
-            side        = Client.SIDE_BUY,
-            type        = Client.ORDER_TYPE_LIMIT,
-            timeInForce = Client.TIME_IN_FORCE_GTC,
-            quantity    = qty,
-            price       = price_str,
+            **order_params,
         )
         return order, limit_price, qty
+
+    @staticmethod
+    def new_client_order_id() -> str:
+        """Create a Binance-valid id to persist before submitting an order."""
+        return f"botbuy-{uuid.uuid4().hex[:24]}"
+
+    def get_order_by_client_order_id(self, client_order_id: str):
+        """Look up a submitted order when the submit response was lost."""
+        return self.client.get_order(
+            symbol=self.symbol, origClientOrderId=client_order_id
+        )
 
     def cancel_and_confirm_terminal(self, order_id):
         """
@@ -179,6 +196,41 @@ class Trader:
                 f"Order {order_id} remains {status.get('status')} after cancel attempt ({detail})"
             )
         return status
+
+    def reconcile_pending_buy(
+        self, order_id=None, client_order_id=None, max_attempts: int = 3
+    ):
+        """
+        Resolve an uncertain limit buy to a *terminal* exchange state.
+
+        The caller must retain its pending intent if this raises.  Retrying is
+        deliberately bounded: it is a recovery operation, not permission to
+        continue placing orders while Binance's state is unknown.
+        """
+        if not order_id and not client_order_id:
+            raise ValueError("pending buy has neither order_id nor client_order_id")
+
+        last_error = None
+        for attempt in range(max_attempts):
+            try:
+                if order_id:
+                    status = self.client.get_order(
+                        symbol=self.symbol, orderId=order_id
+                    )
+                else:
+                    status = self.get_order_by_client_order_id(client_order_id)
+                    order_id = status["orderId"]
+
+                if status.get("status") in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                    return status
+                return self.cancel_and_confirm_terminal(order_id)
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < max_attempts:
+                    continue
+        raise RuntimeError(
+            f"Pending buy could not be reconciled after {max_attempts} attempts: {last_error}"
+        ) from last_error
 
     def sell_all(self, asset: str):
         """
