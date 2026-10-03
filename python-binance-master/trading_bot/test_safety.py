@@ -9,10 +9,37 @@ import tempfile
 import time
 import unittest
 
+from binance.exceptions import BinanceAPIException
 from bot import BinanceCallDeadlineExceeded, call_binance_with_deadline
 from state_store import load_state, save_state
 from strategy import calculate_rsi, check_order_book, check_rsi_divergence
+import trader as trader_module
 from trader import Trader
+
+
+class CountingExchangeInfoClient:
+    LISTED = ("BTCUSDT", "ETHUSDT")
+
+    def __init__(self):
+        self.requests = []
+
+    def get_exchange_info(self):
+        raise AssertionError("the full ~17 MB exchangeInfo must never be downloaded")
+
+    def _get(self, path, data=None):
+        assert path == "exchangeInfo"
+        symbol = data["symbol"]
+        self.requests.append(symbol)
+        if symbol not in self.LISTED:
+            raise BinanceAPIException(None, 400, '{"code":-1121,"msg":"Invalid symbol."}')
+        return {"symbols": [{"symbol": symbol, "filters": [
+            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+            {"filterType": "NOTIONAL", "minNotional": "5"},
+        ]}]}
+
+    def get_all_tickers(self):
+        return [{"symbol": s, "price": "1"} for s in self.LISTED]
 
 
 class BrokenOrderBookClient:
@@ -164,6 +191,24 @@ class SafetyTests(unittest.TestCase):
             def blocked_call():
                 time.sleep(0.1)
             call_binance_with_deadline(blocked_call, 0.01)
+
+    def test_traders_fetch_each_pair_once_never_full_exchange_info(self):
+        trader_module._symbol_rules_cache.clear()
+        client = CountingExchangeInfoClient()
+        for _ in range(25):
+            Trader(client, "BTCUSDT")
+            Trader(client, "ETHUSDT")
+        self.assertEqual(sorted(client.requests), ["BTCUSDT", "ETHUSDT"])
+
+    def test_unlisted_pair_is_rejected(self):
+        trader_module._symbol_rules_cache.clear()
+        with self.assertRaisesRegex(ValueError, "not listed"):
+            Trader(CountingExchangeInfoClient(), "DUSTUSDT")
+
+    def test_listed_symbols_come_from_small_price_endpoint(self):
+        trader_module._listed_symbols_cache.update({"loaded_at": 0.0})
+        symbols = trader_module.load_listed_symbols(CountingExchangeInfoClient())
+        self.assertEqual(symbols, {"BTCUSDT": 1.0, "ETHUSDT": 1.0})
 
     def test_rsi_needs_period_plus_one_closes(self):
         self.assertIsNone(calculate_rsi([100.0] * 14, 14))

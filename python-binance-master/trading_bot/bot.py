@@ -17,7 +17,7 @@ import config
 import screener
 from strategy import get_signal
 from risk_manager import RiskManager
-from trader import Trader
+from trader import Trader, load_listed_symbols
 from trade_logger import log_trade
 from state_store import load_state, save_state
 
@@ -343,6 +343,116 @@ def run_bot():
         round_trip_fee = fee_rate * (1 + (exit_price / entry)) * 100
         return gross - round_trip_fee
 
+    def reconcile_pending_buy_during_runtime():
+        """
+        Actively resolve a buy whose submit/fill outcome became uncertain.
+
+        New entries remain blocked unless this returns True. A filled result
+        is immediately protected with an OCO; if that cannot be placed, the
+        bot attempts and accounts for an emergency exit instead of forgetting
+        the holding.
+        """
+        nonlocal active_symbol, trader, entry_price, quantity, risk_mgr
+        nonlocal in_position, order_list_id, tp_order_id, sl_order_id
+        nonlocal base_asset, entry_time, signal_rsi, signal_vol, signal_ob
+        nonlocal daily_trades, daily_pnl_pct, daily_wins, daily_losses
+
+        pending = persistent_state.get("pending_buy")
+        if not pending:
+            return True
+        try:
+            recovery_trader = Trader(client, pending["symbol"])
+            final_order = recovery_trader.reconcile_pending_buy(
+                order_id=pending.get("order_id"),
+                client_order_id=pending.get("client_order_id"),
+            )
+            filled_qty = float(final_order.get("executedQty", 0) or 0)
+            if filled_qty <= 0:
+                persistent_state["pending_buy"] = None
+                save_state(persistent_state)
+                log("Uncertain buy reconciled with no fill.", YELLOW)
+                return True
+
+            quote_qty = float(final_order.get("cummulativeQuoteQty", 0) or 0)
+            active_symbol = pending["symbol"]
+            base_asset = pending["base_asset"]
+            trader = recovery_trader
+            entry_price = quote_qty / filled_qty if quote_qty > 0 else float(pending["limit_price"])
+            quantity = filled_qty
+            risk_mgr = RiskManager(
+                entry_price, -float(pending["stop_loss_pct"]),
+                float(pending["take_profit_pct"]),
+            )
+            in_position = True
+            entry_time = time.time()
+            signal_rsi = signal_vol = signal_ob = None
+            order_list_id = tp_order_id = sl_order_id = None
+            if not pending.get("trade_counted"):
+                daily_trades += 1
+                pending["trade_counted"] = True
+            persistent_state["daily"]["trades"] = daily_trades
+
+            # Persist the ownership before protection, then only clear intent
+            # after an OCO exists or a confirmed emergency sell closes it.
+            persistent_state["position"] = {
+                "symbol": active_symbol, "base_asset": base_asset,
+                "entry_price": entry_price, "quantity": quantity,
+                "stop_price": risk_mgr.stop_loss_price,
+                "take_profit_price": risk_mgr.take_profit_price,
+                "order_list_id": None, "tp_order_id": None, "sl_order_id": None,
+                "entry_time": entry_time, "signal_rsi": None,
+                "signal_vol": None, "signal_ob": None,
+            }
+            save_state(persistent_state)
+            try:
+                oco = trader.place_oco_order(
+                    quantity, risk_mgr.take_profit_price, risk_mgr.stop_loss_price
+                )
+                order_list_id = oco["orderListId"]
+                for order in oco.get("orderReports") or oco.get("orders") or []:
+                    if order.get("type") == "LIMIT_MAKER":
+                        tp_order_id = order["orderId"]
+                    elif order.get("type") in ("STOP_LOSS", "STOP_LOSS_LIMIT"):
+                        sl_order_id = order["orderId"]
+                persistent_state["pending_buy"] = None
+                persist_runtime_state()
+                log(f"Reconciled buy is protected by OCO {order_list_id}.", GREEN)
+                return True
+            except Exception as oco_error:
+                log(f"Reconciled buy OCO failed: {oco_error}. Emergency closing.", RED)
+                sold = execute_exit(
+                    trader, base_asset, "RUNTIME_RECOVERY_OCO_FAILED", entry_price
+                )
+                if not sold:
+                    persist_runtime_state()
+                    send_telegram(
+                        f"🚨 <b>UNPROTECTED RECOVERED BUY</b>\n{active_symbol}\n"
+                        f"OCO: {oco_error}\nEmergency sell uncertain. Sell manually."
+                    )
+                    return False
+                exit_pnl_pct = net_pnl_pct(entry_price, sold)
+                daily_pnl_pct += exit_pnl_pct
+                if exit_pnl_pct >= 0:
+                    daily_wins += 1
+                else:
+                    daily_losses += 1
+                log_trade(
+                    active_symbol, entry_price, sold, quantity,
+                    "RUNTIME_RECOVERY_OCO_FAILED", None, None, None, entry_time,
+                    fee_rate=float(getattr(config, "TAKER_FEE_RATE", 0.001)),
+                )
+                in_position = False
+                persistent_state["pending_buy"] = None
+                persist_runtime_state()
+                return True
+        except Exception as reconciliation_error:
+            log(f"🚨 Runtime buy reconciliation remains uncertain: {reconciliation_error}", RED)
+            send_telegram(
+                f"🚨 <b>BUY RECONCILIATION RETRY FAILED</b>\n"
+                f"{pending.get('symbol', 'unknown')}\n{reconciliation_error}"
+            )
+            return False
+
     # ── SMART ALERTS ──────────────────────────────────────────
     last_heartbeat    = time.time()   # 3-hour alive ping
     HEARTBEAT_SEC     = 10800         # 3 hours
@@ -487,8 +597,9 @@ def run_bot():
             else:
                 raise RuntimeError(f"pending order is {pending_order.get('status')}")
         except Exception as pending_err:
-            state_load_halt = True
-            log(f"🚨 Pending buy cannot be reconciled: {pending_err}. New entries are disabled.", RED)
+            # pending_buy stays saved, which keeps entries halted while the
+            # main loop keeps retrying reconciliation.
+            log(f"🚨 Pending buy cannot be reconciled yet: {pending_err}. New entries are disabled.", RED)
 
     # If the process crashed after a buy but before its OCO was recorded by
     # Binance, state is the only evidence of that holding. Do not silently
@@ -564,36 +675,73 @@ def run_bot():
     # Do not open a fresh trade if Binance reports a meaningful asset that is
     # not represented by a bot position. It may be a previously interrupted
     # buy or a manual holding; either way, guessing its cost basis is unsafe.
-    reconciliation_halt = state_load_halt or startup_api_halt
-    if not startup_api_halt and not in_position:
+    def check_untracked_holdings():
+        """
+        Return "clear", "untracked" or "api_error" for the wallet check.
+
+        Only "clear" permits new entries. "api_error" means Binance could not
+        be read in time, so the check is retried later rather than assumed.
+        """
+        deadline = float(getattr(config, "BINANCE_STARTUP_DEADLINE_SEC", 15))
         try:
-            account = client.get_account()
-            unknown_assets = []
-            for balance in account.get("balances", []):
-                asset = balance.get("asset", "")
-                quantity_held = float(balance.get("free", 0) or 0) + float(balance.get("locked", 0) or 0)
-                if asset in ("USDT", "BNB") or quantity_held <= 0:
-                    continue
-                symbol = f"{asset}USDT"
-                try:
-                    candidate = Trader(client, symbol)
-                    if candidate._round_qty(quantity_held) >= candidate.min_qty:
-                        unknown_assets.append(f"{quantity_held:g} {asset}")
-                except Exception:
-                    # No active USDT market: do not treat dust/delisted assets
-                    # as an open bot position.
-                    continue
-            if unknown_assets:
-                reconciliation_halt = True
-                message = ", ".join(unknown_assets)
-                log(f"🚨 Unreconciled Binance holdings: {message}. New entries are paused.", RED)
-                send_telegram(
-                    f"🚨 <b>UNRECONCILED HOLDINGS</b>\n{message}\n"
-                    "Bot will not open new trades until this is resolved."
-                )
+            log("Checking wallet for holdings the bot is not tracking...", DIM)
+            account = call_binance_with_deadline(client.get_account, deadline)
+            # Fresh prices: the value check below decides dust vs. position.
+            symbols = call_binance_with_deadline(
+                lambda: load_listed_symbols(client, max_age_sec=0), deadline
+            )
         except Exception as reconciliation_err:
-            reconciliation_halt = True
-            log(f"🚨 Could not reconcile startup holdings: {reconciliation_err}. New entries are paused.", RED)
+            log(
+                f"🚨 Could not check wallet holdings: {reconciliation_err}. "
+                "New entries are paused; retrying shortly.",
+                RED,
+            )
+            return "api_error"
+
+        unknown_assets = []
+        for balance in account.get("balances", []):
+            asset = balance.get("asset", "")
+            quantity_held = float(balance.get("free", 0) or 0) + float(balance.get("locked", 0) or 0)
+            if asset in ("USDT", "BNB") or quantity_held <= 0:
+                continue
+            symbol = f"{asset}USDT"
+            if symbol not in symbols:
+                # No USDT market: dust or a delisted asset, not a bot position.
+                continue
+            try:
+                candidate = Trader(client, symbol)
+                # Below the minimum order value it cannot be sold, and the bot
+                # never buys that small, so it is dust rather than a position.
+                value_usdt = quantity_held * symbols[symbol]
+                if (
+                    candidate._round_qty(quantity_held) >= candidate.min_qty
+                    and value_usdt >= candidate.min_notional
+                ):
+                    unknown_assets.append(f"{quantity_held:g} {asset} (~{value_usdt:.2f} USDT)")
+            except Exception:
+                continue
+
+        if unknown_assets:
+            message = ", ".join(unknown_assets)
+            log(f"🚨 Unreconciled Binance holdings: {message}. New entries are paused.", RED)
+            send_telegram(
+                f"🚨 <b>UNRECONCILED HOLDINGS</b>\n{message}\n"
+                "Bot will not open new trades until this is resolved."
+            )
+            return "untracked"
+        log("Wallet check clear: no untracked holdings.", GREEN)
+        return "clear"
+
+    holdings_check_failed = False
+    holdings_untracked = False
+    if not startup_api_halt and not in_position:
+        holdings_result = check_untracked_holdings()
+        holdings_check_failed = holdings_result == "api_error"
+        holdings_untracked = holdings_result == "untracked"
+    reconciliation_halt = (
+        state_load_halt or startup_api_halt or holdings_untracked
+        or holdings_check_failed or bool(persistent_state.get("pending_buy"))
+    )
 
     while True:
         try:
@@ -651,9 +799,37 @@ def run_bot():
             # ── NO POSITION: Scan the market ──────────────────
             if not in_position:
                 if reconciliation_halt:
-                    log("[Safety Halt] Resolve unreconciled holdings before new entries.", RED)
-                    time.sleep(60)
-                    continue
+                    if persistent_state.get("pending_buy"):
+                        log("[Safety Halt] Actively reconciling pending buy; entries remain blocked.", RED)
+                        reconcile_pending_buy_during_runtime()
+                    elif holdings_check_failed:
+                        holdings_result = check_untracked_holdings()
+                        holdings_check_failed = holdings_result == "api_error"
+                        holdings_untracked = holdings_untracked or holdings_result == "untracked"
+                    # Resolving one cause must not lift a halt held by another.
+                    reconciliation_halt = (
+                        state_load_halt or startup_api_halt or holdings_untracked
+                        or holdings_check_failed or bool(persistent_state.get("pending_buy"))
+                    )
+                    if in_position:
+                        # A reconciled fill is now a protected position; the
+                        # next iteration monitors it before any new entry.
+                        continue
+                    if reconciliation_halt:
+                        if state_load_halt:
+                            reason = "bot_state.json is invalid; review it manually"
+                        elif startup_api_halt:
+                            reason = "startup open-order check failed; restart the bot"
+                        elif holdings_untracked:
+                            reason = "wallet holds coins the bot is not tracking"
+                        elif holdings_check_failed:
+                            reason = "wallet check could not reach Binance; retrying"
+                        else:
+                            reason = "pending buy is still uncertain; retrying"
+                        log(f"[Safety Halt] {reason}. New entries are blocked.", RED)
+                        time.sleep(15)
+                        continue
+                    log("[Safety Halt] Cleared. Resuming market scan.", GREEN)
                 temp_trader  = Trader(client, "BNBUSDT")
                 usdt_balance = temp_trader.get_balance("USDT")
                 log(f"Wallet Balance: {BOLD}{usdt_balance:.4f} USDT{RESET} | Today: {daily_trades}/{MAX_DAILY_TRADES} trades | Daily P&L: {daily_pnl_pct:+.2f}%", CYAN)
