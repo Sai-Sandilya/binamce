@@ -3,9 +3,51 @@
 # =============================================================
 
 import math
+import time
 import uuid
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+
+
+# The full exchangeInfo payload lists every pair (~17 MB) and can take over
+# 90 seconds to download. client.get_symbol_info() fetches all of it for each
+# lookup, so the bot froze while building a Trader per wallet asset. Fetch
+# only the requested pair (~5 KB) and cache it; filters change rarely.
+SYMBOL_RULES_TTL_SEC = 3600
+_symbol_rules_cache = {}   # (id(client), symbol) -> (loaded_at, info)
+_listed_symbols_cache = {"client_id": None, "loaded_at": 0.0, "symbols": {}}
+
+
+def get_symbol_rules(client, symbol: str) -> dict:
+    """Return one pair's exchangeInfo entry, or raise ValueError if unlisted."""
+    symbol = symbol.upper()
+    key = (id(client), symbol)
+    cached = _symbol_rules_cache.get(key)
+    if cached and (time.time() - cached[0]) < SYMBOL_RULES_TTL_SEC:
+        return cached[1]
+    try:
+        response = client._get("exchangeInfo", data={"symbol": symbol})
+    except BinanceAPIException as exc:
+        if exc.code == -1121:
+            raise ValueError(f"{symbol} is not listed on Binance") from exc
+        raise
+    matches = [s for s in response.get("symbols", []) if s.get("symbol") == symbol]
+    if not matches:
+        raise ValueError(f"{symbol} is not listed on Binance")
+    _symbol_rules_cache[key] = (time.time(), matches[0])
+    return matches[0]
+
+
+def load_listed_symbols(client, max_age_sec: float = SYMBOL_RULES_TTL_SEC) -> dict:
+    """Return {pair: last price} for every listed pair from the small all-prices endpoint."""
+    cache = _listed_symbols_cache
+    fresh = (time.time() - cache["loaded_at"]) < max_age_sec
+    if fresh and cache["client_id"] == id(client) and cache["symbols"]:
+        return cache["symbols"]
+    cache["symbols"] = {t["symbol"]: float(t["price"]) for t in client.get_all_tickers()}
+    cache["client_id"] = id(client)
+    cache["loaded_at"] = time.time()
+    return cache["symbols"]
 
 
 class Trader:
@@ -17,7 +59,7 @@ class Trader:
     # ── Symbol Info ───────────────────────────────────────────
     def _load_symbol_filters(self):
         """Load LOT_SIZE, PRICE_FILTER and MIN_NOTIONAL filters from Binance."""
-        info = self.client.get_symbol_info(self.symbol)
+        info = get_symbol_rules(self.client, self.symbol)
         self.step_size    = 1.0
         self.min_qty      = 0.0
         self.min_notional = 10.0
