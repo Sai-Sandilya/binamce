@@ -129,9 +129,16 @@ def execute_exit(trader: Trader, base_asset: str, reason: str, entry_price: floa
             log(f"   Final P&L   : {pnl_pct:.2f}%  LOSS", RED)
             pnl_text = f"{pnl_pct:.2f}% LOSS 🔴"
 
-        time.sleep(2)
-        final_usdt = trader.get_balance("USDT")
-        log(f"USDT Balance : {final_usdt:.4f} USDT", CYAN)
+        # Reporting failures occur after the exchange fill. They must never
+        # cause the caller to believe a completed sell failed.
+        try:
+            time.sleep(2)
+            final_usdt = trader.get_balance("USDT")
+            log(f"USDT Balance : {final_usdt:.4f} USDT", CYAN)
+            wallet_text = f"{final_usdt:.4f} USDT"
+        except Exception as balance_err:
+            log(f"⚠️ Sell filled, but wallet balance refresh failed: {balance_err}", YELLOW)
+            wallet_text = "unavailable"
 
         send_telegram(
             f"🔔 <b>TRADE CLOSED</b>\n\n"
@@ -140,7 +147,7 @@ def execute_exit(trader: Trader, base_asset: str, reason: str, entry_price: floa
             f"<b>Entry:</b> {entry_price:.6f}\n"
             f"<b>Exit:</b> {actual_exit_price:.6f}\n"
             f"<b>P&amp;L:</b> {pnl_text}\n"
-            f"<b>Wallet:</b> {final_usdt:.4f} USDT"
+            f"<b>Wallet:</b> {wallet_text}"
         )
 
         divider("=", BOLD)
@@ -234,6 +241,13 @@ def run_bot():
     # Persist daily circuit-breaker counters and a filled position before
     # attempting its OCO.  Binance remains authoritative for fills/orders.
     persistent_state = load_state()
+    state_load_halt = bool(persistent_state.get("load_error"))
+    if state_load_halt:
+        log(
+            f"🚨 State file is invalid ({persistent_state['load_error']}). "
+            "New entries are disabled until it is reviewed.",
+            RED,
+        )
     if persistent_state["date"] == daily_date.isoformat():
         persisted_daily = persistent_state["daily"]
         daily_pnl_pct = float(persisted_daily.get("pnl_pct", 0.0))
@@ -363,6 +377,54 @@ def run_bot():
     except Exception as e:
         log(f"⚠️ Position auto-recovery check failed: {e}", DIM)
 
+    # Resolve an order submitted before a crash/timeout before treating the
+    # account as flat. Partial fills are positions and need protection too.
+    pending_buy = persistent_state.get("pending_buy")
+    if not in_position and pending_buy:
+        try:
+            if not pending_buy.get("submitted") or not pending_buy.get("order_id"):
+                raise RuntimeError("buy submission was interrupted before an order ID was recorded")
+            pending_order = client.get_order(
+                symbol=pending_buy["symbol"], orderId=pending_buy["order_id"]
+            )
+            executed_qty = float(pending_order.get("executedQty", 0) or 0)
+            if executed_qty > 0:
+                quoted = float(pending_order.get("cummulativeQuoteQty", 0) or 0)
+                fill_price = (
+                    quoted / executed_qty if quoted > 0 else float(pending_buy["limit_price"])
+                )
+                persistent_state["position"] = {
+                    "symbol": pending_buy["symbol"],
+                    "base_asset": pending_buy["base_asset"],
+                    "entry_price": fill_price,
+                    "quantity": executed_qty,
+                    "stop_price": fill_price * (1 - float(pending_buy["stop_loss_pct"]) / 100),
+                    "take_profit_price": fill_price * (1 + float(pending_buy["take_profit_pct"]) / 100),
+                    "order_list_id": None,
+                    "tp_order_id": None,
+                    "sl_order_id": None,
+                    "entry_time": time.time(),
+                    "signal_rsi": None,
+                    "signal_vol": None,
+                    "signal_ob": None,
+                }
+                persistent_state["pending_buy"] = None
+                save_state(persistent_state)
+                log(
+                    f"⚠️ Reconciled a prior {pending_order.get('status')} buy with "
+                    f"{executed_qty} {pending_buy['base_asset']} filled.",
+                    YELLOW,
+                )
+            elif pending_order.get("status") in ("CANCELED", "REJECTED", "EXPIRED"):
+                persistent_state["pending_buy"] = None
+                save_state(persistent_state)
+                log("Cleared prior unfilled buy intent.", YELLOW)
+            else:
+                raise RuntimeError(f"pending order is {pending_order.get('status')}")
+        except Exception as pending_err:
+            state_load_halt = True
+            log(f"🚨 Pending buy cannot be reconciled: {pending_err}. New entries are disabled.", RED)
+
     # If the process crashed after a buy but before its OCO was recorded by
     # Binance, state is the only evidence of that holding. Do not silently
     # resume scanning around it. Recreate exchange-side protection; if that
@@ -427,7 +489,7 @@ def run_bot():
     # Do not open a fresh trade if Binance reports a meaningful asset that is
     # not represented by a bot position. It may be a previously interrupted
     # buy or a manual holding; either way, guessing its cost basis is unsafe.
-    reconciliation_halt = False
+    reconciliation_halt = state_load_halt
     if not in_position:
         try:
             account = client.get_account()
@@ -673,7 +735,26 @@ def run_bot():
 
                     buy_ok = False
                     try:
+                        # Write intent before submitting the exchange order.
+                        # A timeout after submission is ambiguous: Binance may
+                        # have filled it even though this process has no reply.
+                        persistent_state["pending_buy"] = {
+                            "symbol": active_symbol,
+                            "base_asset": base_asset,
+                            "trade_amount": trade_amount,
+                            "take_profit_pct": dyn_tp,
+                            "stop_loss_pct": dyn_sl,
+                            "submitted": False,
+                        }
+                        save_state(persistent_state)
                         order, limit_price, quantity = trader.buy_limit(trade_amount)
+                        persistent_state["pending_buy"].update({
+                            "submitted": True,
+                            "order_id": order["orderId"],
+                            "limit_price": limit_price,
+                            "quantity": quantity,
+                        })
+                        save_state(persistent_state)
                         wait_sec = getattr(config, "LIMIT_FILL_SEC", 120)
                         log(
                             f"[LIMIT BUY] {active_symbol} @ {limit_price:.6f} "
@@ -687,7 +768,12 @@ def run_bot():
                             if status.get("status") == "FILLED":
                                 break
                             if status.get("status") in ("CANCELED", "REJECTED", "EXPIRED"):
-                                raise RuntimeError(f"Limit buy {status.get('status')}")
+                                if float(status.get("executedQty", 0) or 0) > 0:
+                                    log("[LIMIT BUY] Partial fill confirmed; protecting filled quantity.", YELLOW)
+                                    break
+                                persistent_state["pending_buy"] = None
+                                save_state(persistent_state)
+                                raise RuntimeError(f"Limit buy {status.get('status')} without fill")
                             time.sleep(3)
                         else:
                             try:
@@ -742,12 +828,22 @@ def run_bot():
                         # A buy may fill even if the following API request
                         # fails. Persist it before attempting the OCO so a
                         # restart cannot forget an owned asset.
+                        persistent_state["pending_buy"] = None
                         persist_runtime_state()
 
                     except Exception as e:
-                        log(f"[BUY FAILED]: {e}", RED)
+                        pending_buy = persistent_state.get("pending_buy")
+                        if pending_buy:
+                            reconciliation_halt = True
+                            log(
+                                f"🚨 Buy outcome is uncertain: {e}. New entries are paused until "
+                                "the pending exchange order is reconciled.",
+                                RED,
+                            )
+                        else:
+                            log(f"[BUY FAILED]: {e}", RED)
                         send_telegram(
-                            f"🚨 <b>BUY FAILED</b>\n\n"
+                            f"🚨 <b>BUY NEEDS RECONCILIATION</b>\n\n"
                             f"<b>Pair:</b> {active_symbol}\n"
                             f"<b>Error:</b> {e}"
                         )
@@ -1298,10 +1394,25 @@ def run_bot():
             if in_position:
                 try:
                     log("Cancelling active OCO order...", YELLOW)
-                    client.cancel_order_list(symbol=active_symbol, orderListId=order_list_id)
+                    if order_list_id is not None:
+                        client.cancel_order_list(symbol=active_symbol, orderListId=order_list_id)
                 except Exception as e:
                     log(f"Could not cancel OCO: {e}", DIM)
-                execute_exit(trader, base_asset, "MANUAL STOP", entry_price)
+                sold = execute_exit(trader, base_asset, "MANUAL_STOP", entry_price)
+                if sold:
+                    exit_pnl_pct = net_pnl_pct(entry_price, sold)
+                    daily_pnl_pct += exit_pnl_pct
+                    if exit_pnl_pct >= 0:
+                        daily_wins += 1
+                    else:
+                        daily_losses += 1
+                    log_trade(
+                        active_symbol, entry_price, sold, quantity,
+                        "MANUAL_STOP", signal_rsi, signal_vol, signal_ob, entry_time,
+                        fee_rate=float(getattr(config, "TAKER_FEE_RATE", 0.001)),
+                    )
+                    in_position = False
+                    persist_runtime_state()
             send_telegram("⛔ <b>Bot Stopped</b>\nManually stopped by user.")
             break
 
