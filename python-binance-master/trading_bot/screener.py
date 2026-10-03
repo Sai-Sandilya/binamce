@@ -2,6 +2,29 @@
 #   SCREENER — Scans the market for the best trading pairs
 # =============================================================
 
+def read_trading_fee(client):
+    """
+    Return (maker_rate, taker_rate, free_bnb).
+
+    Rates are fractions (0.001 = 0.1%). When 'Use BNB to pay fees' is on
+    and the account holds BNB, Binance already reports the discounted rate.
+    """
+    account = client.get_account()
+    rates = account.get("commissionRates") or {}
+    if rates.get("maker") not in (None, "") and rates.get("taker") not in (None, ""):
+        maker = float(rates["maker"])
+        taker = float(rates["taker"])
+    else:
+        maker = float(account.get("makerCommission", 10)) / 10000.0
+        taker = float(account.get("takerCommission", 10)) / 10000.0
+
+    bnb = 0.0
+    for balance in account.get("balances", []):
+        if balance.get("asset") == "BNB":
+            bnb = float(balance.get("free", 0) or 0)
+            break
+    return maker, taker, bnb
+
 def get_top_usdt_pairs(client, limit=50):
     """
     Fetch all USDT pairs, filter by volume, volatility, and blacklist.
@@ -69,10 +92,7 @@ def check_btc_market(client, interval):
     altcoins fall with it. Even if an altcoin RSI hits 30, it usually
     keeps falling because BTC is dragging the whole market down.
 
-    Safe to trade when BTC 1h RSI is between 35-70:
-      - RSI < 35: BTC itself is oversold/crashing — too risky for alts
-      - RSI > 70: BTC is overbought, alts are pumped — chasing highs
-      - RSI 35-70: neutral/recovering — altcoin dip-buys work well
+    Safe to trade only when the configured BTC 1h RSI band and trend pass.
     """
     from strategy import calculate_rsi, calculate_ema
     try:
@@ -83,29 +103,28 @@ def check_btc_market(client, interval):
         btc_ema21 = calculate_ema(closes, 21)
 
         if btc_rsi is None:
-            return True, "BTC_DATA_UNAVAILABLE"
+            return False, "BTC_DATA_UNAVAILABLE — waiting"
 
-        # Hard crash: BTC RSI below 25 — alts will follow down hard
-        if btc_rsi < 25:
-            return False, f"BTC_CRASHING RSI={btc_rsi:.1f} — alts will follow down"
+        import config
+        rsi_min = getattr(config, "BTC_RSI_MIN", 40)
+        rsi_max = getattr(config, "BTC_RSI_MAX", 65)
 
-        # Extreme overbought: parabolic, alts top out
-        if btc_rsi > 80:
-            return False, f"BTC_PARABOLIC RSI={btc_rsi:.1f} — too hot, wait for pullback"
+        # BTC already extended: alt dips usually keep falling with the pullback.
+        if btc_rsi > rsi_max:
+            return False, f"BTC_EXTENDED RSI={btc_rsi:.1f} — above {rsi_max}, waiting"
 
-        # BTC downtrend: only block if RSI is also very low (both falling hard)
-        # RSI 30-45 with downtrend = altcoins can still bounce if deeply oversold
-        if btc_ema9 is not None and btc_ema21 is not None and btc_ema9 < btc_ema21:
-            if btc_rsi < 30:
-                return False, f"BTC_DOWNTREND RSI={btc_rsi:.1f} EMA9<EMA21 — waiting"
+        # BTC weak or crashing: alts follow it down.
+        if btc_rsi < rsi_min:
+            return False, f"BTC_WEAK RSI={btc_rsi:.1f} — below {rsi_min}, waiting"
 
-        # Bull market signal
-        if btc_rsi >= 60 and btc_ema9 is not None and btc_ema9 > btc_ema21:
-            return True, f"BTC_BULL RSI={btc_rsi:.1f} — bull market, alt dips are opportunities"
+        # Require BTC's own 1h trend to be up. Counter-trend alt buys were the losses.
+        if btc_ema9 is None or btc_ema21 is None or btc_ema9 <= btc_ema21:
+            return False, f"BTC_DOWNTREND RSI={btc_rsi:.1f} EMA9<=EMA21 — waiting"
 
-        return True, f"BTC_OK RSI={btc_rsi:.1f}"
+        return True, f"BTC_OK RSI={btc_rsi:.1f} EMA9>EMA21"
     except Exception as e:
-        return True, f"BTC_CHECK_FAILED({e})"  # don't block on error
+        # Do not open alt positions when the market-wide risk check fails.
+        return False, f"BTC_CHECK_FAILED({e}) — waiting"
 
 
 def find_best_entry(client, symbols, interval):
@@ -164,17 +183,24 @@ def find_best_entry(client, symbols, interval):
                 api_errors = 0
             continue  # skip this coin, move to next
 
-    # Only return confirmed BUY signals, sorted by lowest RSI (most oversold first)
+    # Prefer the strongest confirmation, not the coin that has fallen the furthest.
     buy_candidates = [c for c in candidates if c['signal'] == 'BUY']
-    buy_candidates.sort(key=lambda x: x['rsi'])
+    buy_candidates.sort(key=lambda x: (-x.get('score', 0), -(x['rsi'] or 0)))
 
     # Always show the 3 closest candidates so user knows how far we are
     if not buy_candidates and candidates:
-        closest = sorted(candidates, key=lambda x: x['rsi'])[:3]
+        closest = sorted(
+            candidates,
+            key=lambda x: (-x.get('score', 0), x['rsi'] if x['rsi'] is not None else 999),
+        )[:3]
         print("   [Screener] No BUY yet — closest candidates:", flush=True)
         for c in closest:
             rsi_str  = f"{c['rsi']:.1f}" if c['rsi'] is not None else "N/A"
             vol_str  = f"{c['vol_ratio']:.1f}x"
-            print(f"      {c['symbol']:12s} RSI={rsi_str:5s} Vol={vol_str:5s} | {c['reason']}", flush=True)
+            print(
+                f"      {c['symbol']:12s} score={c.get('score', 0)}/4 "
+                f"RSI={rsi_str:5s} Vol={vol_str:5s} | {c['reason']}",
+                flush=True,
+            )
 
     return buy_candidates

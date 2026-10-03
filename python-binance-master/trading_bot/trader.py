@@ -108,6 +108,49 @@ class Trader:
 
         return order, fill_price, exec_qty
 
+    def _format_price(self, price: float) -> str:
+        rounded = self._round_price(price)
+        if self.tick_size <= 0:
+            return f"{rounded:.8f}"
+        precision = max(0, int(round(-math.log(self.tick_size, 10), 0)))
+        return f"{rounded:.{precision}f}"
+
+    def buy_limit(self, usdt_amount: float):
+        """
+        Rest a limit buy on the best bid so the order is a maker, not a taker.
+        Returns the open order, the limit price, and the quantity.
+        The caller waits for the fill and cancels it if price runs away.
+        """
+        book = self.client.get_order_book(symbol=self.symbol, limit=5)
+        if not book.get("bids"):
+            raise ValueError(f"No bid on {self.symbol}")
+
+        price_str = self._format_price(float(book["bids"][0][0]))
+        limit_price = float(price_str)
+        qty = self._round_qty(usdt_amount / limit_price)
+
+        if qty < self.min_qty:
+            raise ValueError(
+                f"Calculated quantity {qty} is below Binance minimum {self.min_qty}. "
+                f"Increase your USDT trade amount."
+            )
+
+        notional = qty * limit_price
+        if notional < self.min_notional:
+            raise ValueError(
+                f"Order notional {notional:.2f} USDT is below minimum {self.min_notional} USDT."
+            )
+
+        order = self.client.create_order(
+            symbol      = self.symbol,
+            side        = Client.SIDE_BUY,
+            type        = Client.ORDER_TYPE_LIMIT,
+            timeInForce = Client.TIME_IN_FORCE_GTC,
+            quantity    = qty,
+            price       = price_str,
+        )
+        return order, limit_price, qty
+
     def sell_all(self, asset: str):
         """
         Sell the entire free balance of an asset.

@@ -16,3 +16,5 @@ venv*/
 .env
 trading_bot/.env
 trading_bot/__pycache__/
+trading_bot/bot_state.json
+trading_bot/trades_v2.csv

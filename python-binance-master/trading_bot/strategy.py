@@ -1,18 +1,13 @@
 # =============================================================
-#   STRATEGY — Professional Multi-Indicator Signal Engine
+#   STRATEGY — four non-overlapping checks
 #
-#   Indicators used:
-#     1. RSI(14)              — oversold detection
-#     2. EMA 9/21 cross       — trend direction filter
-#     3. MACD(12,26,9)        — momentum reversal confirmation
-#     4. Volume spike         — real buying interest filter
-#     5. Bollinger Bands(20)  — statistical extreme confirmation
-#     6. ATR(14)              — dynamic TP/SL sizing per coin
+#     1. Daily EMA 50 / 200     — trend direction
+#     2. 4h Fibonacci 0.50–0.618 — pullback location
+#     3. 4h RSI divergence      — momentum turning
+#     4. 4h volume spike        — the move has participation
 #
-#   BUY requires ALL 4 core conditions:
-#     RSI < 30  AND  EMA9 > EMA21  AND  volume spike  AND  MACD improving
-#
-#   ATR sets TP = 2× ATR, SL = 1× ATR (always 2:1 reward/risk ratio)
+#   A buy requires all four. Stop sits beyond the swing low.
+#   Target is the prior swing high, and only if it pays >= 1.5x the stop.
 # =============================================================
 
 
@@ -367,7 +362,7 @@ def check_whale_trades(client, symbol, min_usdt=20000, lookback=50):
         trades   = client.get_recent_trades(symbol=symbol, limit=lookback)
         large    = [t for t in trades if float(t['qty']) * float(t['price']) >= min_usdt]
         if not large:
-            return True, 50.0  # no whale trades — don't block signal
+            return False, 0.0  # no large trades — not evidence of buying
         buys     = sum(1 for t in large if not t['isBuyerMaker'])
         buy_pct  = (buys / len(large)) * 100
         return buy_pct >= 50.0, round(buy_pct, 1)
@@ -394,14 +389,17 @@ def check_rsi_divergence(closes, rsi_period=14, lookback=20):
     if len(closes) < lookback + rsi_period:
         return False, "insufficient_data"
 
-    # Build RSI series for last `lookback` closes
-    rsi_series = []
-    for i in range(lookback):
-        window = closes[-(lookback - i + rsi_period): -(lookback - i) or None]
-        r = calculate_rsi(window, rsi_period)
-        rsi_series.append(r if r is not None else 50.0)
-
     prices = closes[-lookback:]
+    # Calculate each RSI against all price history available at that candle.
+    # Slicing only `rsi_period` prices supplies 14 closes to RSI(14), which
+    # needs 15 and silently turned every value into the 50.0 fallback.
+    start = len(closes) - lookback
+    rsi_series = [
+        calculate_rsi(closes[:start + index + 1], rsi_period)
+        for index in range(lookback)
+    ]
+    if any(value is None for value in rsi_series):
+        return False, "insufficient_RSI_history"
 
     # Find two lowest price points
     min1_idx = prices.index(min(prices))
@@ -437,153 +435,321 @@ def check_order_book(client, symbol, depth=20):
       Order book shows LIVE intent — real money waiting to buy RIGHT NOW.
       A strong bid wall means price is unlikely to drop further.
 
-    Returns (is_bullish: bool, ratio: float)
+    Returns (is_bullish: bool, ratio: float, spread_pct: float)
     """
     try:
         book      = client.get_order_book(symbol=symbol, limit=depth)
         bid_vol   = sum(float(b[1]) for b in book['bids'])
         ask_vol   = sum(float(a[1]) for a in book['asks'])
+        best_bid  = float(book['bids'][0][0]) if book['bids'] else 0.0
+        best_ask  = float(book['asks'][0][0]) if book['asks'] else 0.0
+        spread_pct = ((best_ask - best_bid) / best_bid * 100) if best_bid > 0 else 99.0
         if ask_vol == 0:
-            return False, 0.0
+            return False, 0.0, round(spread_pct, 3)
         ratio = bid_vol / ask_vol
-        return ratio >= 1.3, round(ratio, 2)
+        return ratio >= 1.3, round(ratio, 2), round(spread_pct, 3)
     except Exception:
-        return True, 1.0  # don't block signal on API error
+        # A missing order book cannot confirm liquidity or bid support.
+        return False, 0.0, 99.0
+
+
+def check_bounce_started(klines):
+    """
+    True only after sellers have already lost the last closed candle.
+
+    A green candle that closes in its upper half, or a hammer / bullish
+    engulfing, means the dip has started to reverse. Buying the red
+    candle itself is how this bot kept catching falling knives.
+    """
+    closed = klines[:-1]
+    if len(closed) < 2:
+        return False
+
+    candle = closed[-1]
+    open_ = float(candle[1])
+    high = float(candle[2])
+    low = float(candle[3])
+    close = float(candle[4])
+    if high <= low:
+        return False
+
+    green_upper_half = close > open_ and close >= (high + low) / 2
+    pattern, _bullish = check_candle_pattern(klines)
+    return green_upper_half or pattern in ("HAMMER", "ENGULFING")
+
+
+def calculate_adx(klines, period=14):
+    """
+    Trend strength plus direction.
+    Returns (adx, plus_di, minus_di), or None.
+    ADX above 20 means a trend exists. Plus DI above minus DI means that trend is up.
+    """
+    closed = klines[:-1]
+    if len(closed) < period * 2 + 1:
+        return None
+
+    trs, plus_dm, minus_dm = [], [], []
+    for i in range(1, len(closed)):
+        high = float(closed[i][2])
+        low = float(closed[i][3])
+        prev_high = float(closed[i - 1][2])
+        prev_low = float(closed[i - 1][3])
+        prev_close = float(closed[i - 1][4])
+        up = high - prev_high
+        down = prev_low - low
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+
+    def _wilder(values):
+        total = sum(values[:period])
+        out = [total]
+        for value in values[period:]:
+            total = total - (total / period) + value
+            out.append(total)
+        return out
+
+    dxs = []
+    last_plus_di = None
+    last_minus_di = None
+    for atr, plus, minus in zip(_wilder(trs), _wilder(plus_dm), _wilder(minus_dm)):
+        if atr == 0:
+            continue
+        plus_di = 100 * plus / atr
+        minus_di = 100 * minus / atr
+        last_plus_di = plus_di
+        last_minus_di = minus_di
+        denom = plus_di + minus_di
+        dxs.append(0.0 if denom == 0 else 100 * abs(plus_di - minus_di) / denom)
+
+    if len(dxs) < period or last_plus_di is None:
+        return None
+    adx = sum(dxs[:period]) / period
+    for dx in dxs[period:]:
+        adx = (adx * (period - 1) + dx) / period
+    return round(adx, 2), round(last_plus_di, 2), round(last_minus_di, 2)
+
+
+def obv_is_rising(klines, lookback=5):
+    """
+    On-balance volume. Rising OBV means closes are being confirmed by volume,
+    which is the volume check in place of a raw spike.
+    """
+    closed = klines[:-1]
+    if len(closed) < lookback + 2:
+        return False
+
+    obv = 0.0
+    series = []
+    prev_close = float(closed[0][4])
+    for candle in closed[1:]:
+        close = float(candle[4])
+        volume = float(candle[5])
+        if close > prev_close:
+            obv += volume
+        elif close < prev_close:
+            obv -= volume
+        series.append(obv)
+        prev_close = close
+
+    return len(series) > lookback and series[-1] > series[-1 - lookback]
+
+
+def find_golden_zone(klines, lookback=80):
+    """
+    Fibonacci pullback of the last meaningful rally on this timeframe.
+
+    Golden zone = price has retraced 50% to 61.8% of the move from the
+    swing low up to the swing high. That is the pullback area the blueprint
+    uses. A rally smaller than 8% is ignored because the zone is just noise.
+    """
+    closed = klines[:-1]
+    if len(closed) < 30:
+        return None
+    window = closed[-min(lookback, len(closed)):]
+    highs = [float(k[2]) for k in window]
+    lows = [float(k[3]) for k in window]
+    high_idx = highs.index(max(highs))
+    if high_idx < 5:
+        return None
+
+    swing_high = highs[high_idx]
+    swing_low = min(lows[:high_idx])
+    if swing_low <= 0 or swing_high <= swing_low:
+        return None
+    if (swing_high - swing_low) / swing_low < 0.08:
+        return None
+
+    price = float(klines[-1][4])
+    span = swing_high - swing_low
+    retrace = (swing_high - price) / span
+    return {
+        "swing_high": swing_high,
+        "swing_low": swing_low,
+        "retrace": round(retrace, 3),
+        "in_zone": 0.50 <= retrace <= 0.618,
+        "price": price,
+    }
 
 
 # ── MASTER SIGNAL FUNCTION ────────────────────────────────────
 def get_signal(client, symbol, interval,
-               rsi_period=14, ema_fast=9, ema_slow=21, rsi_oversold=30,
-               volume_multiplier=1.2, bb_period=20):
+               rsi_period=14, ema_fast=50, ema_slow=200, rsi_oversold=30,
+               volume_multiplier=1.3, bb_period=20):
     """
-    Multi-timeframe signal engine (8 indicators):
+    Seven configured checks. A buy requires every one:
 
-    TREND   (4h candles): EMA9 > EMA21  — long-term uptrend?
-    TREND   (1h candles): EMA9 > EMA21  — medium-term uptrend?
-    ENTRY   (5m candles): RSI < 30       — short-term oversold dip?
-    CONFIRM (5m candles): Volume spike + MACD turning up
-    DEPTH   (live book) : Bids > Asks    — real buyers waiting now?
+      Trend     — daily EMA50 above EMA200, price above EMA200, ADX/+DI up
+      Level     — 4h price sitting in the Fibonacci 0.50–0.618 pullback
+      RSI       — bullish divergence and a non-crash oversold RSI range
+      MACD      — histogram improving
+      Bands     — price at the lower Bollinger band
+      Volume    — OBV rising, reversal candle, and 1.3x volume spike
+
+    Stop goes just beyond the swing low. Target is the swing high.
+    The trade is skipped when that target pays less than 1.5x the stop.
     """
-    # ── 5m candles for RSI, MACD, Volume, BB, ATR ────────────
-    klines = client.get_klines(symbol=symbol, interval=interval, limit=200)
-    closes = [float(k[4]) for k in klines][:-1]
+    import config as _config
 
-    # ── 1h candles for trend EMA ──────────────────────────────
-    klines_1h  = client.get_klines(symbol=symbol, interval="1h", limit=50)
-    closes_1h  = [float(k[4]) for k in klines_1h][:-1]
-    ema_f_1h   = calculate_ema(closes_1h, ema_fast)
-    ema_s_1h   = calculate_ema(closes_1h, ema_slow)
+    daily = client.get_klines(symbol=symbol, interval="1d", limit=250)
+    daily_closes = [float(k[4]) for k in daily][:-1]
+    ema50 = calculate_ema(daily_closes, ema_fast)
+    ema200 = calculate_ema(daily_closes, ema_slow)
+    daily_price = daily_closes[-1] if daily_closes else None
 
-    # ── 4h candles for higher timeframe trend ─────────────────
-    klines_4h  = client.get_klines(symbol=symbol, interval="4h", limit=50)
-    closes_4h  = [float(k[4]) for k in klines_4h][:-1]
-    ema_f_4h   = calculate_ema(closes_4h, ema_fast)
-    ema_s_4h   = calculate_ema(closes_4h, ema_slow)
-
-    # ── 5m indicators ─────────────────────────────────────────
-    rsi = calculate_rsi(closes, rsi_period)
-
-    # 5m EMAs for display only
-    ema_f = calculate_ema(closes, ema_fast)
-    ema_s = calculate_ema(closes, ema_slow)
-
-    macd_val, sig_val, macd_hist, prev_hist = calculate_macd(closes)
-    vol_spike, vol_ratio = check_volume_spike(klines, multiplier=volume_multiplier)
-
-    bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(closes, period=bb_period)
-    current_price = closes[-1]
-    at_bb_lower   = bb_lower is not None and current_price <= bb_lower
-
-    atr = calculate_atr(klines)
-
-    # ── Order book depth (live bid/ask pressure) ──────────────
-    ob_bullish, ob_ratio = check_order_book(client, symbol)
-
-    # ── Whale trade detection ──────────────────────────────────
-    whale_buying, whale_buy_pct = check_whale_trades(client, symbol)
-
-    # ── RSI Divergence ─────────────────────────────────────────
-    divergence, div_desc = check_rsi_divergence(closes, rsi_period)
-
-    # ── Stochastic RSI ─────────────────────────────────────────
-    stoch_k, stoch_d = calculate_stoch_rsi(closes, rsi_period)
-    cond_stoch = (stoch_k is not None and stoch_k < 20)  # strongly oversold
-
-    # ── Candle pattern ─────────────────────────────────────────
-    candle_pattern, candle_bullish = check_candle_pattern(klines)
-
-    # ── Dynamic TP/SL from ATR ────────────────────────────────
-    if atr is not None and current_price > 0:
-        atr_pct = (atr / current_price) * 100
-        # Keep minimum floors above fee drag to avoid "small-win but net-loss" behavior.
-        tp_pct  = round(max(2.5, min(5.0, atr_pct * 2.0)), 2)
-        sl_pct  = round(max(1.5, min(2.5, atr_pct * 1.0)), 2)
+    entry_interval = interval or "4h"
+    klines_4h = client.get_klines(symbol=symbol, interval=entry_interval, limit=200)
+    closes_4h = [float(k[4]) for k in klines_4h][:-1]
+    rsi = calculate_rsi(closes_4h, rsi_period)
+    divergence, div_desc = check_rsi_divergence(closes_4h, rsi_period)
+    vol_spike, vol_ratio = check_volume_spike(klines_4h, multiplier=volume_multiplier)
+    macd_val, _macd_signal, macd_hist, prev_hist = calculate_macd(
+        closes_4h,
+        getattr(_config, "MACD_FAST", 12),
+        getattr(_config, "MACD_SLOW", 26),
+        getattr(_config, "MACD_SIGNAL_PERIOD", 9),
+    )
+    bb_upper, _bb_mid, bb_lower = calculate_bollinger_bands(
+        closes_4h,
+        getattr(_config, "BB_PERIOD", bb_period),
+        getattr(_config, "BB_STD_DEV", 2.0),
+    )
+    zone = find_golden_zone(klines_4h)
+    adx_pack = calculate_adx(klines_4h, getattr(_config, "ADX_PERIOD", 14))
+    if adx_pack is None:
+        adx, plus_di, minus_di = None, None, None
     else:
-        tp_pct = 2.5
-        sl_pct = 1.5
+        adx, plus_di, minus_di = adx_pack
+    adx_min = getattr(_config, "ADX_MIN", 20)
+    obv_rising = obv_is_rising(klines_4h)
+    atr = calculate_atr(klines_4h)
 
-    # ── Fallback: not enough data ─────────────────────────────
-    if rsi is None or ema_f_1h is None or ema_s_1h is None:
-        return _result("HOLD", rsi, ema_f, ema_s, macd_hist, prev_hist,
-                       vol_ratio, at_bb_lower, tp_pct, sl_pct, ob_ratio, reason="INSUFFICIENT_DATA")
+    _bullish_book, ob_ratio, spread_pct = check_order_book(client, symbol)
+    max_spread = getattr(_config, "MAX_SPREAD_PCT", 0.25)
+    min_rr = getattr(_config, "MIN_REWARD_RISK", 1.5)
 
-    # ── Core conditions ───────────────────────────────────────
-    cond_4h_trend = (ema_f_4h is not None and ema_s_4h is not None
-                     and ema_f_4h > ema_s_4h)           # 4h uptrend
-    cond_trend    = ema_f_1h > ema_s_1h                 # 1h uptrend
-    cond_rsi      = rsi < rsi_oversold                  # 5m oversold
-    cond_volume   = vol_spike                            # real buying interest
-    cond_macd     = (macd_hist is not None
-                     and prev_hist is not None
-                     and macd_hist > prev_hist)          # momentum turning up
-    cond_ob       = ob_bullish                           # bids > asks (live buyers)
-    cond_whale    = whale_buying                         # whales buying this coin
-    # ── Core: must ALL pass ───────────────────────────────────
-    # These 6 are non-negotiable — without them, signal is weak
-    all_core = (cond_4h_trend and cond_trend and cond_rsi
-                and cond_volume and cond_macd and cond_ob)
+    bounce_confirmed = check_bounce_started(klines_4h)
 
-    # ── Bonus confirmations (not required, but counted) ───────
-    # StochRSI and Whale are bonus — they increase confidence
-    # but alone shouldn't block a good trade
-    bonus_stoch = cond_stoch                   # StochRSI < 20
-    bonus_whale = cond_whale                   # whale majority buying
-    bonus_diverg = divergence                  # RSI divergence
-    bonus_candle = candle_bullish              # hammer/doji/engulfing
-    bonus_bb     = at_bb_lower                # price at BB lower band
-    bonus_macd_p = (macd_hist is not None and macd_hist > 0)  # MACD positive
-    bonus_5m_ema = (ema_f is not None and ema_s is not None and ema_f > ema_s)
+    cond_ema = (
+        ema50 is not None and ema200 is not None and daily_price is not None
+        and ema50 > ema200 and daily_price > ema200
+    )
+    cond_adx = (
+        adx is not None and plus_di is not None and minus_di is not None
+        and adx >= adx_min and plus_di > minus_di
+    )
+    cond_trend = cond_ema and cond_adx
+    cond_zone = zone is not None and zone["in_zone"]
+    rsi_floor = getattr(_config, "RSI_OVERSOLD_MIN", 20)
+    cond_rsi = rsi is not None and rsi_floor <= rsi < rsi_oversold
+    cond_div = bool(divergence)
+    cond_macd = (
+        macd_hist is not None and prev_hist is not None
+        and macd_hist > prev_hist
+    )
+    current_price = closes_4h[-1] if closes_4h else 0.0
+    cond_bb = bb_lower is not None and current_price <= bb_lower
+    cond_volume = obv_rising and bounce_confirmed and vol_spike
+    cond_spread = spread_pct <= max_spread
 
-    signal = "BUY" if all_core else "HOLD"
+    tp_pct = float(getattr(_config, "TAKE_PROFIT_PCT", 4.5))
+    max_sl = abs(float(getattr(_config, "STOP_LOSS_PCT", -2.0)))
+    sl_pct = max_sl
+    fee_pct = float(getattr(_config, "TAKER_FEE_RATE", 0.001)) * 2 * 100
+    rr_ok = False
+    if zone is not None and zone["price"] > 0:
+        swing_risk = zone["price"] - zone["swing_low"]
+        atr_risk = atr if atr else 0.0
+        risk = max(swing_risk, atr_risk)
+        reward = zone["swing_high"] - zone["price"]
+        if risk > 0 and reward > 0:
+            sl_pct = round(risk / zone["price"] * 100, 2)
+            tp_pct = round(reward / zone["price"] * 100, 2)
+            net_tp = tp_pct - fee_pct
+            # A stop wider than the config cap is skipped. Clamping it to 2%
+            # would sit inside the swing and get hit by normal noise.
+            rr_ok = (net_tp / sl_pct) >= min_rr and 1.5 <= sl_pct <= max_sl
 
-    if signal == "HOLD":
+    conditions = (
+        cond_trend, cond_zone, cond_rsi, cond_div, cond_macd, cond_bb, cond_volume,
+    )
+    score = sum(conditions)
+    required_score = getattr(_config, "MIN_CONFIRMATIONS", len(conditions))
+    signal = "BUY" if score == len(conditions) and score >= required_score and cond_spread and rr_ok else "HOLD"
+
+    if signal == "BUY":
+        retrace = zone["retrace"]
+        adx_txt = f"{adx:.1f}" if adx is not None else "N/A"
+        reason = (
+            f"EMA+ADX+ZONE+RSI+MACD+BB+VOLUME [score:{score}/{len(conditions)}] "
+            f"ADX={adx_txt} fib={retrace:.2f} {div_desc}"
+        )
+    else:
         failed = []
-        if not cond_rsi:      failed.append(f"RSI={rsi:.1f}(need<{rsi_oversold})")
-        if not cond_4h_trend: failed.append("4h_downtrend")
-        if not cond_trend:    failed.append(f"1h_EMA{ema_fast}<EMA{ema_slow}")
-        if not cond_volume:   failed.append(f"Vol={vol_ratio:.1f}x(need>{volume_multiplier}x)")
-        if not cond_macd:     failed.append("MACD_not_rising")
-        if not cond_ob:       failed.append(f"OB={ob_ratio:.2f}(asks>bids)")
-        reason = " | ".join(failed)
-    else:
-        # Count bonus score — shown in reason so you know signal strength
-        bonuses = []
-        if bonus_stoch:  bonuses.append(f"StochRSI={stoch_k}")
-        if bonus_whale:  bonuses.append(f"Whale={whale_buy_pct:.0f}%buys")
-        if bonus_diverg: bonuses.append(div_desc)
-        if bonus_candle: bonuses.append(candle_pattern)
-        if bonus_bb:     bonuses.append("BB_touch")
-        if bonus_macd_p: bonuses.append("MACD_positive")
-        if bonus_5m_ema: bonuses.append("5m_EMA_aligned")
-        score = len(bonuses)
-        reason = f"ALL_CONFIRMED [score:{score}/7]" + (f" +{','.join(bonuses)}" if bonuses else "")
+        if not cond_ema:
+            failed.append("daily_EMA50<=EMA200")
+        elif not cond_adx:
+            adx_txt = f"{adx:.1f}" if adx is not None else "N/A"
+            if adx is None or adx < adx_min:
+                failed.append(f"ADX={adx_txt}(need>={adx_min})")
+            else:
+                failed.append(f"DI_down +{plus_di:.0f}/-{minus_di:.0f}")
+        if zone is None:
+            failed.append("no_swing")
+        elif not cond_zone:
+            failed.append(f"fib={zone['retrace']:.2f}(need 0.50-0.62)")
+        if not cond_rsi:
+            rsi_txt = f"{rsi:.1f}" if rsi is not None else "N/A"
+            failed.append(f"RSI={rsi_txt}(need {rsi_floor}-{rsi_oversold})")
+        if not cond_div:
+            failed.append("no_RSI_divergence")
+        if not cond_macd:
+            failed.append("MACD_not_rising")
+        if not cond_bb:
+            failed.append("not_at_BB_lower")
+        if not obv_rising:
+            failed.append("OBV_falling")
+        elif not bounce_confirmed:
+            failed.append("no_reversal_candle")
+        elif not vol_spike:
+            failed.append(f"Vol={vol_ratio:.1f}x(need>{volume_multiplier}x)")
+        if not cond_spread:
+            failed.append(f"spread={spread_pct:.2f}%")
+        if score == len(conditions) and cond_spread and not rr_ok:
+            if sl_pct > max_sl:
+                failed.append(f"stop {sl_pct:.1f}%>{max_sl:.1f}%")
+            else:
+                failed.append(f"reward/risk {tp_pct:.1f}/{sl_pct:.1f}")
+        reason = " | ".join(failed) if failed else "HOLD"
 
-    return _result(signal, rsi, ema_f_1h, ema_s_1h, macd_hist, prev_hist,
-                   vol_ratio, at_bb_lower, tp_pct, sl_pct, ob_ratio, reason)
+    return _result(
+        signal, rsi, ema50, ema200, macd_hist, prev_hist,
+        vol_ratio, cond_bb, tp_pct, sl_pct, ob_ratio, reason, score,
+    )
 
 
 def _result(signal, rsi, ema_f, ema_s, macd_hist, prev_hist,
-            vol_ratio, at_bb_lower, tp_pct, sl_pct, ob_ratio=1.0, reason=""):
+            vol_ratio, at_bb_lower, tp_pct, sl_pct, ob_ratio=1.0, reason="", score=0):
     """Build a consistent result dict for all return paths."""
     return {
         "signal":      signal,
@@ -598,4 +764,5 @@ def _result(signal, rsi, ema_f, ema_s, macd_hist, prev_hist,
         "sl_pct":      sl_pct,
         "ob_ratio":    ob_ratio,
         "reason":      reason,
+        "score":       score,
     }
