@@ -6,8 +6,10 @@ Run directly with:
 
 import os
 import tempfile
+import time
 import unittest
 
+from bot import BinanceCallDeadlineExceeded, call_binance_with_deadline
 from state_store import load_state, save_state
 from strategy import calculate_rsi, check_order_book, check_rsi_divergence
 from trader import Trader
@@ -24,6 +26,46 @@ class CancelFailureClient:
 
     def get_order(self, **_kwargs):
         return {"status": "PARTIALLY_FILLED", "executedQty": "1"}
+
+
+class CancelSucceededStatusUnavailableClient:
+    def cancel_order(self, **_kwargs):
+        return {"status": "CANCELED"}
+
+    def get_order(self, **_kwargs):
+        raise RuntimeError("status endpoint unavailable")
+
+
+class FinalFillDuringCancelClient:
+    def __init__(
+        self, initial_status="PARTIALLY_FILLED", final_status="CANCELED",
+        executed_qty="2", quote_qty="20"
+    ):
+        self.initial_status = initial_status
+        self.final_status = final_status
+        self.executed_qty = executed_qty
+        self.quote_qty = quote_qty
+        self.cancelled = False
+        self.calls = 0
+
+    def cancel_order(self, **_kwargs):
+        self.cancelled = True
+        return {"status": "CANCELED"}
+
+    def get_order(self, **kwargs):
+        self.calls += 1
+        status = self.final_status if self.cancelled else self.initial_status
+        if "origClientOrderId" in kwargs:
+            return {
+                "orderId": 42, "status": status,
+                "executedQty": self.executed_qty,
+                "cummulativeQuoteQty": self.quote_qty,
+            }
+        return {
+            "orderId": 42, "status": status,
+            "executedQty": self.executed_qty,
+            "cummulativeQuoteQty": self.quote_qty,
+        }
 
 
 class SafetyTests(unittest.TestCase):
@@ -62,6 +104,66 @@ class SafetyTests(unittest.TestCase):
         trader.symbol = "BTCUSDT"
         with self.assertRaisesRegex(RuntimeError, "remains PARTIALLY_FILLED"):
             trader.cancel_and_confirm_terminal(123)
+
+    def test_cancellation_success_without_status_confirmation_is_uncertain(self):
+        trader = Trader.__new__(Trader)
+        trader.client = CancelSucceededStatusUnavailableClient()
+        trader.symbol = "BTCUSDT"
+        with self.assertRaisesRegex(RuntimeError, "Cannot confirm terminal status"):
+            trader.cancel_and_confirm_terminal(123)
+
+    def test_reconciliation_uses_final_fills_that_arrive_during_cancellation(self):
+        client = FinalFillDuringCancelClient()
+        trader = Trader.__new__(Trader)
+        trader.client = client
+        trader.symbol = "BTCUSDT"
+        status = trader.reconcile_pending_buy(order_id=42)
+        self.assertTrue(client.cancelled)
+        self.assertEqual(status["status"], "CANCELED")
+        self.assertEqual(status["executedQty"], "2")
+        self.assertEqual(status["cummulativeQuoteQty"], "20")
+
+    def test_completed_buy_is_accepted_without_a_cancellation_attempt(self):
+        client = FinalFillDuringCancelClient(
+            initial_status="FILLED", final_status="FILLED"
+        )
+        trader = Trader.__new__(Trader)
+        trader.client = client
+        trader.symbol = "BTCUSDT"
+        status = trader.reconcile_pending_buy(order_id=42)
+        self.assertFalse(client.cancelled)
+        self.assertEqual(status["status"], "FILLED")
+
+    def test_lost_submission_response_is_reconciled_by_client_order_id(self):
+        client = FinalFillDuringCancelClient(final_status="FILLED")
+        trader = Trader.__new__(Trader)
+        trader.client = client
+        trader.symbol = "BTCUSDT"
+        status = trader.reconcile_pending_buy(client_order_id="botbuy-response-lost")
+        self.assertEqual(status["orderId"], 42)
+        self.assertEqual(status["executedQty"], "2")
+
+    def test_restart_retains_pending_intent_until_terminal_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            state = load_state(path)
+            state["pending_buy"] = {
+                "symbol": "BTCUSDT",
+                "client_order_id": "botbuy-persisted",
+                "submitted": False,
+            }
+            save_state(state, path)
+            restored = load_state(path)
+            self.assertEqual(
+                restored["pending_buy"]["client_order_id"], "botbuy-persisted"
+            )
+            self.assertFalse(restored["pending_buy"]["submitted"])
+
+    def test_startup_deadline_interrupts_a_stalled_api_call(self):
+        with self.assertRaises(BinanceCallDeadlineExceeded):
+            def blocked_call():
+                time.sleep(0.1)
+            call_binance_with_deadline(blocked_call, 0.01)
 
     def test_rsi_needs_period_plus_one_closes(self):
         self.assertIsNone(calculate_rsi([100.0] * 14, 14))

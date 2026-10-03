@@ -175,7 +175,14 @@ def initialize_grid(trader: Trader, grid_prices: list):
     return active_grid_orders
 
 def run_grid_bot():
-    client = Client(config.API_KEY, config.API_SECRET, testnet=config.TESTNET)
+    client = Client(
+        config.API_KEY,
+        config.API_SECRET,
+        testnet=config.TESTNET,
+        requests_params={
+            "timeout": float(getattr(config, "BINANCE_REQUEST_TIMEOUT_SEC", 10))
+        },
+    )
     
     # Fix for Timestamp -1021 error (sync local time with Binance server)
     try:
