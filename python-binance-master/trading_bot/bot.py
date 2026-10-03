@@ -387,6 +387,16 @@ def run_bot():
             pending_order = client.get_order(
                 symbol=pending_buy["symbol"], orderId=pending_buy["order_id"]
             )
+            # A partial buy can remain open after the process stops. Cancel
+            # and re-read it before protecting the executed quantity; without
+            # this, additional fills could arrive outside the OCO quantity.
+            if pending_order.get("status") not in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+                client.cancel_order(
+                    symbol=pending_buy["symbol"], orderId=pending_buy["order_id"]
+                )
+                pending_order = client.get_order(
+                    symbol=pending_buy["symbol"], orderId=pending_buy["order_id"]
+                )
             executed_qty = float(pending_order.get("executedQty", 0) or 0)
             if executed_qty > 0:
                 quoted = float(pending_order.get("cummulativeQuoteQty", 0) or 0)
@@ -409,6 +419,8 @@ def run_bot():
                     "signal_ob": None,
                 }
                 persistent_state["pending_buy"] = None
+                daily_trades += 1
+                persistent_state["daily"]["trades"] = daily_trades
                 save_state(persistent_state)
                 log(
                     f"⚠️ Reconciled a prior {pending_order.get('status')} buy with "
@@ -477,9 +489,19 @@ def run_bot():
                 and execute_exit(trader, base_asset, "RECOVERY_OCO_FAILED", entry_price)
             )
             if sold:
+                exit_pnl_pct = net_pnl_pct(entry_price, sold)
+                daily_pnl_pct += exit_pnl_pct
+                if exit_pnl_pct >= 0:
+                    daily_wins += 1
+                else:
+                    daily_losses += 1
+                log_trade(
+                    active_symbol, entry_price, sold, quantity,
+                    "RECOVERY_OCO_FAILED", signal_rsi, signal_vol, signal_ob, entry_time,
+                    fee_rate=float(getattr(config, "TAKER_FEE_RATE", 0.001)),
+                )
                 in_position = False
-                persistent_state["position"] = None
-                save_state(persistent_state)
+                persist_runtime_state()
             else:
                 send_telegram(
                     f"🚨 <b>UNPROTECTED POSITION</b>\n{saved_position.get('symbol', 'unknown')}\n"

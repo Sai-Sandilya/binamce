@@ -43,13 +43,15 @@ def load_state(path=STATE_PATH):
 
 def save_state(state, path=STATE_PATH):
     """Atomically replace state so an interruption cannot leave partial JSON."""
+    if state.get("load_error"):
+        raise RuntimeError(
+            "Refusing to overwrite invalid bot state; resolve the corruption explicitly first."
+        )
     directory = os.path.dirname(path)
     fd, temporary_path = tempfile.mkstemp(prefix=".bot_state-", dir=directory, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            saved_state = dict(state)
-            saved_state["load_error"] = None
-            json.dump(saved_state, handle, sort_keys=True)
+            json.dump(state, handle, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)

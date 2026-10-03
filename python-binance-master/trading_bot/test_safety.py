@@ -36,6 +36,10 @@ class SafetyTests(unittest.TestCase):
                 handle.write("{not valid json")
             state = load_state(path)
             self.assertIsNotNone(state["load_error"])
+            with self.assertRaises(RuntimeError):
+                save_state(state, path)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "{not valid json")
 
     def test_order_book_failure_blocks_entry(self):
         bullish, ratio, spread = check_order_book(BrokenOrderBookClient(), "BTCUSDT")
