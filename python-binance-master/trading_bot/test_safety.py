@@ -10,11 +10,20 @@ import unittest
 
 from state_store import load_state, save_state
 from strategy import calculate_rsi, check_order_book, check_rsi_divergence
+from trader import Trader
 
 
 class BrokenOrderBookClient:
     def get_order_book(self, **_kwargs):
         raise RuntimeError("network down")
+
+
+class CancelFailureClient:
+    def cancel_order(self, **_kwargs):
+        raise RuntimeError("network timeout")
+
+    def get_order(self, **_kwargs):
+        return {"status": "PARTIALLY_FILLED", "executedQty": "1"}
 
 
 class SafetyTests(unittest.TestCase):
@@ -46,6 +55,13 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(bullish)
         self.assertEqual(ratio, 0.0)
         self.assertGreater(spread, 1.0)
+
+    def test_timeout_does_not_accept_nonterminal_partial_order(self):
+        trader = Trader.__new__(Trader)
+        trader.client = CancelFailureClient()
+        trader.symbol = "BTCUSDT"
+        with self.assertRaisesRegex(RuntimeError, "remains PARTIALLY_FILLED"):
+            trader.cancel_and_confirm_terminal(123)
 
     def test_rsi_needs_period_plus_one_closes(self):
         self.assertIsNone(calculate_rsi([100.0] * 14, 14))

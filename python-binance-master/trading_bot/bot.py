@@ -798,12 +798,12 @@ def run_bot():
                                 raise RuntimeError(f"Limit buy {status.get('status')} without fill")
                             time.sleep(3)
                         else:
-                            try:
-                                client.cancel_order(symbol=active_symbol, orderId=order["orderId"])
-                            except Exception:
-                                pass
-                            status = client.get_order(symbol=active_symbol, orderId=order["orderId"])
+                            # Never clear pending intent until Binance confirms
+                            # the order cannot receive further fills.
+                            status = trader.cancel_and_confirm_terminal(order["orderId"])
                             if float(status.get("executedQty", 0) or 0) <= 0:
+                                persistent_state["pending_buy"] = None
+                                save_state(persistent_state)
                                 raise RuntimeError("Limit buy not filled — cancelled")
                             log("[LIMIT BUY] Partial fill. Cancelled the rest.", YELLOW)
 

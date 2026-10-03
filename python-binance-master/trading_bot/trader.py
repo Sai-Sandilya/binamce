@@ -151,6 +151,35 @@ class Trader:
         )
         return order, limit_price, qty
 
+    def cancel_and_confirm_terminal(self, order_id):
+        """
+        Cancel an outstanding order and return its confirmed terminal state.
+
+        A cancellation request alone is not enough: an order may continue to
+        fill while the request races through the exchange.  Callers must keep
+        their persisted pending-order record when this method raises.
+        """
+        terminal_statuses = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+        cancel_error = None
+        try:
+            self.client.cancel_order(symbol=self.symbol, orderId=order_id)
+        except Exception as exc:
+            cancel_error = exc
+
+        try:
+            status = self.client.get_order(symbol=self.symbol, orderId=order_id)
+        except Exception as status_error:
+            raise RuntimeError(
+                f"Cannot confirm terminal status after cancel attempt: {status_error}"
+            ) from status_error
+
+        if status.get("status") not in terminal_statuses:
+            detail = f"cancel error: {cancel_error}" if cancel_error else "cancel not terminal"
+            raise RuntimeError(
+                f"Order {order_id} remains {status.get('status')} after cancel attempt ({detail})"
+            )
+        return status
+
     def sell_all(self, asset: str):
         """
         Sell the entire free balance of an asset.
