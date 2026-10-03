@@ -65,6 +65,9 @@ COIN_BLACKLIST = [
     "WBTCUSDT", "WBETHUSDT", "BNSOLUSDT",
 ]
 MIN_PRICE      = 1.0    # Exclude all coins trading below $1.00
+# Only buy alts when BTC itself is trending up but not already extended.
+BTC_RSI_MIN    = 40
+BTC_RSI_MAX    = 65
 
 # ── TRADE AMOUNT ─────────────────────────────────────────────
 # Percentage of your available USDT balance to use (e.g. 95 = 95%)
@@ -75,18 +78,28 @@ TRADE_AMOUNT_PCT = 30  # %
 # Binance charges ~0.1% fee per trade (0.2% round-trip).
 # TP must exceed SL + 0.4% to have positive expected value at 50% win rate.
 # Rule of thumb: TP should be at least 2x SL (after fees).
-STOP_LOSS_PCT   = -1.5   # Allow more room to breathe vs fees
-TAKE_PROFIT_PCT = 2.5    # TP must exceed fees + SL to be profitable
+STOP_LOSS_PCT   = -2.0   # Wider than one noisy 5m wick
+TAKE_PROFIT_PCT = 4.5    # Keep reward at least 2x the stop after fees
 
 # ── STRATEGY SETTINGS ────────────────────────────────────────
-KLINE_INTERVAL = "5m"    # 5m candles
+# Every setting below is an active entry filter. A trade must satisfy all
+# seven checks: trend, Fibonacci level, RSI range/divergence, MACD turn,
+# Bollinger lower-band support, OBV/reversal, and a volume spike.
+KLINE_INTERVAL = "4h"
 
 RSI_PERIOD     = 14      # RSI lookback period
-RSI_OVERSOLD   = 30      # Buy when RSI below this
-RSI_OVERBOUGHT = 70      # Considered overbought above this
+RSI_OVERSOLD   = 32      # Upper bound for a pullback entry
+RSI_OVERSOLD_MIN = 20    # Below this is treated as a crash, not a pullback
+RSI_OVERBOUGHT = 70
+MIN_CONFIRMATIONS = 7    # All seven configured entry checks must pass
+MAX_SPREAD_PCT = 0.25    # Skip pairs whose bid/ask spread is wider than this
+MIN_REWARD_RISK = 1.5    # Swing-high target must pay at least this many times the stop
 
-EMA_FAST = 9             # Fast EMA (reacts quickly)
-EMA_SLOW = 21            # Slow EMA (shows medium trend)
+EMA_FAST = 50            # Daily trend EMA
+EMA_SLOW = 200           # Daily trend EMA
+ADX_PERIOD = 14          # Trend-strength lookback
+ADX_MIN    = 20          # Below this the trend is too weak to buy
+LIMIT_FILL_SEC = 120     # Cancel a limit buy if it is still open after this
 
 # ── MACD SETTINGS ────────────────────────────────────────────
 MACD_FAST          = 12  # Fast EMA for MACD
@@ -94,9 +107,8 @@ MACD_SLOW          = 26  # Slow EMA for MACD
 MACD_SIGNAL_PERIOD = 9   # Signal line smoothing
 
 # ── VOLUME CONFIRMATION ───────────────────────────────────────
-# Require current candle volume > this multiple of 20-period average
-# 1.2 = 20% above average — real buying interest filter
-VOLUME_MULTIPLIER = 1.2
+# 1.3 = 30% above the 20-candle average (inside the 25–40% conviction band)
+VOLUME_MULTIPLIER = 1.3
 
 # ── BOLLINGER BANDS ───────────────────────────────────────────
 BB_PERIOD  = 20          # SMA period for Bollinger middle band
